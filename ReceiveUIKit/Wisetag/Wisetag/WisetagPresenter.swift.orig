@@ -1,0 +1,251 @@
+import AnalyticsKit
+import Combine
+import CombineSchedulers
+import LoggingKit
+import ReceiveKit
+import TransferResources
+import TWFoundation
+import UIKit
+import UserKit
+
+// sourcery: AutoMockable
+protocol WisetagShareableLinkStatusUpdater: AnyObject {
+    func updateShareableLinkStatus(isDiscoverable: Bool)
+}
+
+// sourcery: AutoMockable
+protocol WisetagPresenter: AnyObject {
+    func start(with view: WisetagView)
+    func dismiss()
+}
+
+final class WisetagPresenterImpl {
+    private weak var view: WisetagView?
+    private let profile: Profile
+    private let wisetagUseCase: WisetagUseCase
+    private let viewModelMapper: WisetagViewModelMapper
+    private let router: WisetagRouter
+    private let analyticsViewTracker: AnalyticsViewTrackerImpl<WisetagAnalyticsView>
+    private let featureService: FeatureService
+    private let pasteboard: Pasteboard
+    private let scheduler: AnySchedulerOf<DispatchQueue>
+    private var status: ShareableLinkStatus = .ineligible
+    private var fetchShareableLinkStatusCancellable: AnyCancellable?
+    private var updateShareableLinkStatusCancellable: AnyCancellable?
+
+    init(
+        profile: Profile,
+        wisetagUseCase: WisetagUseCase,
+        viewModelMapper: WisetagViewModelMapper,
+        router: WisetagRouter,
+        analyticsTracker: AnalyticsTracker,
+        featureService: FeatureService,
+        pasteboard: Pasteboard,
+        scheduler: AnySchedulerOf<DispatchQueue>
+    ) {
+        self.profile = profile
+        self.wisetagUseCase = wisetagUseCase
+        self.viewModelMapper = viewModelMapper
+        self.router = router
+        analyticsViewTracker = AnalyticsViewTrackerImpl(
+            contextIdentity: WisetagAnalyticsView.identity,
+            analyticsTracker: analyticsTracker
+        )
+        self.featureService = featureService
+        self.pasteboard = pasteboard
+        self.scheduler = scheduler
+    }
+}
+
+// MARK: - WisetagPresenter
+
+extension WisetagPresenterImpl: WisetagPresenter {
+    func start(with view: WisetagView) {
+        self.view = view
+        view.showHud()
+        fetchShareableLinkStatusCancellable = wisetagUseCase.shareableLinkStatus(for: profile.id)
+            .flatMap { [weak self] status -> AnyPublisher<(ShareableLinkStatus, UIImage?), Error> in
+                guard let self else {
+                    return .just((status, nil))
+                }
+                return self.fetchQRCode(status: status)
+            }
+            .asResult()
+            .receive(on: scheduler)
+            .sink { [weak self] result in
+                guard let self else {
+                    return
+                }
+                self.view?.hideHud()
+                switch result {
+                case let .success((status, image)):
+                    self.analyticsViewTracker.track(WisetagAnalyticsView.Loaded.success)
+                    self.status = status
+                    self.configureView(
+                        status: status,
+                        qrCodeImage: image
+                    )
+                case let .failure(error):
+                    self.showError()
+                    self.trackLoadedError(error)
+                }
+            }
+    }
+
+    func dismiss() {
+        let isDiscoverable = isShareableLinkDiscoverable()
+        router.dismiss(isShareableLinkDiscoverable: isDiscoverable)
+    }
+}
+
+// MARK: WisetagViewModelDelegate
+
+extension WisetagPresenterImpl: WisetagViewModelDelegate {
+    func headerLinkButtonTapped() {
+        analyticsViewTracker.track(WisetagAnalyticsView.NicknameOpened())
+        router.showWisetagLearnMore()
+    }
+
+    func copyLinkTapped(_ urlString: String) {
+        analyticsViewTracker.track(WisetagAnalyticsView.Copied())
+        pasteboard.addToClipboard(urlString)
+        view?.showSnackbar(message: L10n.Wisetag.SnackBar.Message.copyLink)
+    }
+
+    func shareLinkTapped(_ urlString: String) {
+        analyticsViewTracker.track(WisetagAnalyticsView.ShareStarted())
+        let shareSheetText = L10n.Wisetag.ShareSheet.Text.shareLink + "\n" + urlString
+        view?.showShareSheet(text: shareSheetText)
+    }
+
+    func privacyPolicyLinkTapped(_ urlString: String) {
+        router.showPrivacyPolicy(urlString)
+    }
+
+    func footerButtonTapped() {
+        analyticsViewTracker.track(WisetagAnalyticsView.ActivateStarted())
+        updateShareableLinkStatus(isDiscoverable: true)
+    }
+
+    func contactOnWiseTapped() {
+        guard let nickname = getNickname() else {
+            softFailure("[REC] Attempt to show contact on wise bottom sheet without a nickname.")
+            return
+        }
+        analyticsViewTracker.track(WisetagAnalyticsView.SettingsOpened())
+        router.showContactOnWise(nickname: nickname)
+    }
+
+    func scanQRcodeTapped() {
+        analyticsViewTracker.track(WisetagAnalyticsView.ScanOpened())
+        // TODO: This feature is not ready for development yet
+        // and it's hidden behind a feature toggle
+        router.showScanQRcode()
+    }
+}
+
+// MARK: - WisetagShareableLinkStatusUpdater
+
+extension WisetagPresenterImpl: WisetagShareableLinkStatusUpdater {
+    func updateShareableLinkStatus(isDiscoverable: Bool) {
+        view?.showHud()
+        updateShareableLinkStatusCancellable = wisetagUseCase.updateShareableLinkStatus(
+            profileId: profile.id,
+            isDiscoverable: isDiscoverable
+        )
+        .flatMap { [weak self] status -> AnyPublisher<(ShareableLinkStatus, UIImage?), Error> in
+            guard let self else {
+                return .just((status, nil))
+            }
+            return self.fetchQRCode(status: status)
+        }
+        .asResult()
+        .receive(on: scheduler)
+        .sink { [weak self] result in
+            guard let self else {
+                return
+            }
+            self.view?.hideHud()
+            switch result {
+            case let .success((status, image)):
+                self.status = status
+                self.configureView(
+                    status: status,
+                    qrCodeImage: image
+                )
+            case .failure:
+                self.showError()
+            }
+        }
+    }
+}
+
+// MARK: - Helpers
+
+private extension WisetagPresenterImpl {
+    func configureView(
+        status: ShareableLinkStatus,
+        qrCodeImage: UIImage?
+    ) {
+        let isScanBarButtonAvailable = featureService.getValue(for: ReceiveKitFeatures.wisetagScanNavigationBarButtonEnabled)
+        let viewModel = viewModelMapper.make(
+            profile: profile,
+            status: status,
+            qrCodeImage: qrCodeImage,
+            shouldShowScanNavigationBarButton: isScanBarButtonAvailable,
+            delegate: self
+        )
+        view?.configure(with: viewModel)
+    }
+
+    func showError() {
+        view?.showDismissableAlert(
+            title: L10n.Generic.Error.title,
+            message: L10n.Generic.Error.message
+        )
+    }
+
+    func getNickname() -> String? {
+        guard case let .eligible(discoverability) = status,
+              case let .discoverable(_, nickname) = discoverability else {
+            return nil
+        }
+        return nickname
+    }
+
+    func isShareableLinkDiscoverable() -> Bool {
+        guard case let .eligible(discoverability) = status,
+              case .discoverable = discoverability else {
+            return false
+        }
+        return true
+    }
+
+    func trackLoadedError(_ error: Error) {
+        analyticsViewTracker.track(
+            WisetagAnalyticsView.Loaded.error(message: error.nonLocalizedDescription)
+        )
+    }
+
+    func fetchQRCode(status: ShareableLinkStatus) -> AnyPublisher<(ShareableLinkStatus, UIImage?), Error> {
+        guard case let .eligible(discoverability) = status else {
+            return .just((status, nil))
+        }
+        let content: String = { branding in
+            switch discoverability {
+            case .notDiscoverable:
+                return branding.urlString
+            case let .discoverable(urlString, _):
+                return urlString
+            }
+        }(Branding.current)
+        return wisetagUseCase.qrCode(content: content)
+            .map { image in
+                (status, image)
+            }
+            .catch { _ -> AnyPublisher<(ShareableLinkStatus, UIImage?), Error> in
+                .just((status, nil))
+            }
+            .eraseToAnyPublisher()
+    }
+}
